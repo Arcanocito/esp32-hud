@@ -16,6 +16,7 @@ import android.widget.TextView
 import androidx.core.view.children
 import org.json.JSONObject
 import timber.log.Timber
+import android.graphics.Bitmap
 
 const val GMAPS_PACKAGE = "com.google.android.apps.maps"
 
@@ -97,59 +98,222 @@ internal class GMapsNotification(cx: Context, sbn: StatusBarNotification) : Navi
     private fun parseRemoteView(group: ViewGroup): NavigationData {
         val data = navigationData
 
-        val directionText = findChildByName(group, "text") as TextView?
-        val etaText = findChildByName(group, "header_text") as TextView?
-        val titleText = findChildByName(group, "title") as TextView?
-        // val timeText = findChildByName(group, "time") as TextView?
-        val rightIcon = findChildByName(group, "right_icon") as ImageView?
+        val directionText = findChildByName(group, "text") as? TextView
+        val etaText = findChildByName(group, "header_text") as? TextView
+        val titleText = findChildByName(group, "title") as? TextView
+        val rightIcon = findChildByName(group, "right_icon") as? ImageView
 
-        // parse ETE & ETA
-        if (etaText != null) {
-            val etaList = etaText.text.split("·")
-            if (etaList.size == 3) {
-                val distance = etaList[1].trim()
-                data.eta = NavigationEta(etaList[2].removeSuffix("ETA").trim(), etaList[0].trim(), distance)
-            }
+        /*
+         * New Google Maps notification:
+         *
+         * header_text:
+         * Maps · Ankunft um 15:19
+         *
+         * Old Google Maps notification:
+         * 12 min · 5 km · 15:19 ETA
+         */
+        parseEtaText(etaText?.text)?.let {
+            data.eta = it
         }
 
+        /*
+         * New Google Maps notification:
+         *
+         * title:
+         * 600 m · Rechts abbiegen auf Giselastraße
+         *
+         * Old Google Maps notification:
+         *
+         * title:
+         * 600 m
+         *
+         * text:
+         * Rechts abbiegen auf Giselastraße
+         */
         var nextDistance = ""
-        if (titleText != null && titleText.text.trim().isNotEmpty()) {
-            nextDistance = titleText.text.trim().toString()
-        }
+        var titleDirection = ""
+
+        titleText?.text
+            ?.toString()
+            ?.replace('\u00A0', ' ')
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { title ->
+                val titleParts = title.split('·', limit = 2)
+
+                if (titleParts.size == 2) {
+                    nextDistance = titleParts[0].trim()
+                    titleDirection = titleParts[1].trim()
+                } else {
+                    // Old layout: title contains only the maneuver distance.
+                    nextDistance = title
+                }
+            }
+
         var nextRoad = ""
         var nextRoadDesc = ""
-        if (directionText?.text !is Spanned) {
-            // must be the text "Rerouting..."
-            Timber.w("Direction Text is not Spanned, text: ${directionText?.text}")
-            nextRoad = directionText?.text as String
-        } else {
-            // Road names are in Typeface.BOLD, sub texts are in Typeface.NORMAL
-            var directionList = ParserHelper.splitByStyleSpan(directionText?.text as Spanned, Typeface.NORMAL, 2)
-            if (directionList.isNotEmpty()) {
-                val nextRoadList = mutableListOf(directionList.first())
-                val nextRoadDescList = mutableListOf<ParserHelper.SpanSplitResult>()
 
-                val rest = directionList.drop(1)
-                val index = rest.indexOfFirst { it.isKeySpan && it.text.trim() != "/" }
-                if (index == -1) {
-                    nextRoadList.addAll(rest)
-                } else {
-                    nextRoadList.addAll(rest.subList(0, index))
-                    nextRoadDescList.addAll(rest.subList(index, rest.size))
+        if (titleDirection.isNotEmpty()) {
+            /*
+             * New layout: the complete direction is already contained in title.
+             *
+             * Example:
+             * "Rechts abbiegen auf Giselastraße"
+             */
+            nextRoad = titleDirection
+        } else {
+            /*
+             * Old layout: parse the separate styled direction text.
+             */
+            val directionContent = directionText?.text
+
+            if (directionContent !is Spanned) {
+                // For example: "Rerouting..."
+                nextRoad = directionContent?.toString().orEmpty()
+
+                if (nextRoad.isNotEmpty()) {
+                    Timber.w(
+                        "Direction Text is not Spanned, text: %s",
+                        nextRoad
+                    )
                 }
-                nextRoad = nextRoadList.joinToString(" ") { it.text }
-                nextRoadDesc = nextRoadDescList.joinToString(" ") { it.text }
+            } else {
+                /*
+                 * Road names are in Typeface.BOLD.
+                 * Additional direction text is in Typeface.NORMAL.
+                 */
+                val directionList = ParserHelper.splitByStyleSpan(
+                    directionContent,
+                    Typeface.NORMAL,
+                    2
+                )
+
+                if (directionList.isNotEmpty()) {
+                    val nextRoadList = mutableListOf(directionList.first())
+                    val nextRoadDescList =
+                        mutableListOf<ParserHelper.SpanSplitResult>()
+
+                    val rest = directionList.drop(1)
+
+                    val index = rest.indexOfFirst {
+                        it.isKeySpan && it.text.trim() != "/"
+                    }
+
+                    if (index == -1) {
+                        nextRoadList.addAll(rest)
+                    } else {
+                        nextRoadList.addAll(rest.subList(0, index))
+                        nextRoadDescList.addAll(
+                            rest.subList(index, rest.size)
+                        )
+                    }
+
+                    nextRoad = nextRoadList
+                        .joinToString(" ") { it.text }
+                        .trim()
+
+                    nextRoadDesc = nextRoadDescList
+                        .joinToString(" ") { it.text }
+                        .trim()
+                }
             }
         }
-        data.nextDirection = NavigationDirection(nextRoad, nextRoadDesc, nextDistance)
 
-        (rightIcon?.drawable as BitmapDrawable?)?.bitmap?.also {
-            data.actionIcon = NavigationIcon(it.copy(it.config, false))
+        data.nextDirection = NavigationDirection(
+            nextRoad,
+            nextRoadDesc,
+            nextDistance
+        )
+
+        /*
+         * Copy the maneuver icon.
+         */
+        (rightIcon?.drawable as? BitmapDrawable)?.bitmap?.let { bitmap ->
+            val bitmapConfig = bitmap.config ?: Bitmap.Config.ARGB_8888
+
+            data.actionIcon = NavigationIcon(
+                bitmap.copy(bitmapConfig, false)
+            )
         }
 
         // Timber.v("$data")
 
         return data
+    }
+
+    private fun parseEtaText(text: CharSequence?): NavigationEta? {
+        val rawText = text
+            ?.toString()
+            ?.replace('\u00A0', ' ')
+            ?.trim()
+            .orEmpty()
+
+        if (rawText.isEmpty()) {
+            return null
+        }
+
+        /*
+         * New German Google Maps format:
+         *
+         * Maps · Ankunft um 15:19
+         *
+         * Some English variants are supported as well:
+         *
+         * Maps · Arrival at 3:19 PM
+         * Maps · Arrive at 3:19 PM
+         */
+        val newFormatMatch = Regex(
+            pattern = """(?:Ankunft\s+um|Arrival\s+at|Arrive\s+at)\s+(.+)$""",
+            option = RegexOption.IGNORE_CASE
+        ).find(rawText)
+
+        if (newFormatMatch != null) {
+            val arrivalTime = newFormatMatch
+                .groupValues[1]
+                .trim()
+
+            return NavigationEta(
+                arrivalTime,
+                "", // Remaining travel time is not present in the new layout.
+                ""  // Remaining total distance is not present in the new layout.
+            )
+        }
+
+        /*
+         * Old Google Maps format:
+         *
+         * 12 min · 5 km · 15:19 ETA
+         */
+        val etaParts = rawText
+            .split('·')
+            .map { it.trim() }
+
+        if (etaParts.size >= 3) {
+            val remainingTime = etaParts[0]
+            val remainingDistance = etaParts[1]
+
+            val arrivalTime = etaParts
+                .drop(2)
+                .joinToString(" · ")
+                .replace(
+                    Regex(
+                        pattern = """\s*ETA\s*$""",
+                        option = RegexOption.IGNORE_CASE
+                    ),
+                    ""
+                )
+                .trim()
+
+            return NavigationEta(
+                arrivalTime,
+                remainingTime,
+                remainingDistance
+            )
+        }
+
+        Timber.w("Unknown Google Maps ETA format: %s", rawText)
+
+        return null
     }
 
     // for debugging
