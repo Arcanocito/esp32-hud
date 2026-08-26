@@ -131,6 +131,7 @@ void setup() {
 	UI::init();
 
 	Data::init();
+	Data::removeAllFiles();
 
 	lcd.setBrightness(Pref::brightness);
 	ThemeControl::dark();

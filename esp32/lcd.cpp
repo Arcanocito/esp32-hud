@@ -1,144 +1,77 @@
+#include "config.h"
 #include "lcd.h"
-#include "registers.h"
-#include <SPI.h>
 
-SimpleSt7789::SimpleSt7789(SPIClass* spi,
-                           const SPISettings& spiSettings,
-                           uint16_t width,
-                           uint16_t height,
-                           uint8_t cs,
-                           uint8_t dc,
-                           uint8_t rst,
-                           uint8_t backlight,
-                           Rotation rotation)
-: _spi(spi), _spiSettings(spiSettings), _width(width), _height(height), _pinCs(cs), _pinDc(dc), _pinRst(rst),
-  _pinBacklight(backlight), _rotation(rotation), _xOffset(0), _yOffset(0) {
+Esp32RgbDisplay lcd;
+
+Esp32RgbDisplay::Esp32RgbDisplay() {
+	_bus = new Arduino_ESP32RGBPanel(GFX_NOT_DEFINED, GFX_NOT_DEFINED, GFX_NOT_DEFINED, PIN_RGB_DE, PIN_RGB_VSYNC,
+	                                 PIN_RGB_HSYNC, PIN_RGB_PCLK, PIN_RGB_R0, PIN_RGB_R1, PIN_RGB_R2, PIN_RGB_R3,
+	                                 PIN_RGB_R4, PIN_RGB_G0, PIN_RGB_G1, PIN_RGB_G2, PIN_RGB_G3, PIN_RGB_G4, PIN_RGB_G5,
+	                                 PIN_RGB_B0, PIN_RGB_B1, PIN_RGB_B2, PIN_RGB_B3, PIN_RGB_B4);
+
+	_gfx = new Arduino_RPi_DPI_RGBPanel(_bus, 800, 0, 8, 4, 8, 480, 0, 8, 4, 8, 1, 16000000, true);
 }
 
-void SimpleSt7789::init() {
-	pinMode(_pinCs, OUTPUT);
-	pinMode(_pinDc, OUTPUT);
+bool Esp32RgbDisplay::init() {
+	ledcSetup(BACKLIGHT_CHANNEL, 1000, 8);
+	ledcAttachPin(PIN_BACKLIGHT, BACKLIGHT_CHANNEL);
+	ledcWrite(BACKLIGHT_CHANNEL, 0);
 
-	if (_pinRst != -1) {
-		pinMode(_pinRst, OUTPUT);
-	}
+	// In the Arduino_GFX release supplied with this display begin() returns void.
+	_gfx->begin();
+	_gfx->fillScreen(BLACK);
 
-	if (_pinBacklight != -1) {
-		ledcAttach(_pinBacklight, 1000, 10);
-		ledcWrite(_pinBacklight, 100);
-	}
-
-	reset();
-
-	sendCommand(REG_SLPOUT);
-	delay(120);
-	setRotation(_rotation);
-
-	sendCommandFixed(REG_COLMOD, {0x05});
-	sendCommandFixed(REG_RAMCTRL, {0x00, 0xE8});
-	sendCommandFixed(REG_PORCTRL, {0x0C, 0x0C, 0x00, 0x33, 0x33});
-	sendCommandFixed(REG_GCTRL, {0x35});
-	sendCommandFixed(REG_VCOMS, {0x35});
-	sendCommandFixed(REG_LCMCTRL, {0x2C});
-	sendCommandFixed(REG_VDVVRHEN, {0x01});
-	sendCommandFixed(REG_VRHS, {0x13});
-	sendCommandFixed(REG_VDVS, {0x20});
-	sendCommandFixed(REG_FRCTR2, {0x0F});
-	sendCommandFixed(REG_PWCTRL1, {0xA4, 0xA1});
-	sendCommandFixed(0xD6, {0xA1});
-	sendCommandFixed(REG_PVGAMCTRL, {0xF0, 0x00, 0x04, 0x04, 0x04, 0x05, 0x29, 0x33, 0x3E, 0x38, 0x12, 0x12, 0x28, 0x30});
-	sendCommandFixed(REG_NVGAMCTRL, {0xF0, 0x07, 0x0A, 0x0D, 0x0B, 0x07, 0x28, 0x33, 0x3E, 0x36, 0x14, 0x14, 0x29, 0x32});
-	sendCommand(REG_INVON);
-	sendCommand(REG_SLPOUT);
-	delay(120);
-	sendCommand(REG_DISPON);
-
+	_initialized = true;
 	setBrightness(100);
+	return true;
 }
 
-void SimpleSt7789::reset() {
-	if (_pinRst == -1)
+void Esp32RgbDisplay::setBrightness(uint8_t percent) {
+	percent            = constrain(percent, 0, 100);
+	const uint8_t duty = map(percent, 0, 100, 0, 255);
+	ledcWrite(BACKLIGHT_CHANNEL, duty);
+}
+
+void Esp32RgbDisplay::setMirror(bool enabled) {
+	_mirror = enabled;
+}
+
+void Esp32RgbDisplay::flushWindow(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t* color) {
+	if (!_initialized || color == nullptr) {
 		return;
-
-	digitalWrite(_pinCs, LOW);
-	delay(50);
-	digitalWrite(_pinRst, LOW);
-	delay(50);
-	digitalWrite(_pinRst, HIGH);
-	delay(50);
-}
-
-void SimpleSt7789::setRotation(Rotation rotation) {
-	uint8_t madctl = 0;
-	switch (rotation) {
-	case ROTATION_0: madctl = MADCTL_MX | MADCTL_MY | MADCTL_RGB; break;
-	case ROTATION_90: madctl = MADCTL_MY | MADCTL_MV | MADCTL_RGB; break;
-	case ROTATION_180: madctl = MADCTL_RGB; break;
-	case ROTATION_270: madctl = MADCTL_MX | MADCTL_MV | MADCTL_RGB; break;
 	}
 
-	sendCommand(REG_MADCTL, &madctl, 1);
-}
+	const uint16_t width  = x2 - x1 + 1;
+	const uint16_t height = y2 - y1 + 1;
 
-void SimpleSt7789::setOffset(uint16_t xOffset, uint16_t yOffset) {
-	_xOffset = xOffset;
-	_yOffset = yOffset;
-}
-
-void SimpleSt7789::setBrightness(uint8_t percent) {
-	if (_pinBacklight == -1)
+	// Normal output
+	if (!_mirror) {
+		_gfx->draw16bitRGBBitmap(x1, y1, color, width, height);
 		return;
-
-	percent = constrain(percent, 0, 100);
-	ledcWrite(_pinBacklight, percent * 10);
-}
-
-void SimpleSt7789::flushWindow(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t* color) {
-	const auto w        = x2 - x1 + 1;
-	const auto h        = y2 - y1 + 1;
-	const auto numBytes = w * h * sizeof(uint16_t);
-	setAddrWindow(x1, y1, x2, y2);
-	sendData((const uint8_t*)color, numBytes);
-}
-
-void SimpleSt7789::invertDisplay(bool invert) {
-	sendCommand(invert ? REG_INVON : REG_INVOFF);
-}
-
-void SimpleSt7789::setAddrWindow(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
-	const auto ox1 = x1 + _xOffset;
-	const auto ox2 = x2 + _xOffset;
-	const auto oy1 = y1 + _yOffset;
-	const auto oy2 = y2 + _yOffset;
-
-	if (_rotation == ROTATION_180 || _rotation == ROTATION_270) {
-		sendCommandFixed(REG_CASET, {(uint8_t)((ox1) >> 8), (uint8_t)(ox1), (uint8_t)(ox2 >> 8), (uint8_t)(ox2)});
-		sendCommandFixed(REG_RASET, {(uint8_t)((oy1) >> 8), (uint8_t)(oy1), (uint8_t)(oy2 >> 8), (uint8_t)(oy2)});
-	} else {
-		sendCommandFixed(REG_CASET, {(uint8_t)((oy1) >> 8), (uint8_t)(oy1), (uint8_t)(oy2 >> 8), (uint8_t)(oy2)});
-		sendCommandFixed(REG_RASET, {(uint8_t)((ox1) >> 8), (uint8_t)(ox1), (uint8_t)(ox2 >> 8), (uint8_t)(ox2)});
 	}
-	sendCommand(REG_RAMWR);
-}
 
-void SimpleSt7789::sendCommand(uint8_t command, const uint8_t* data, size_t size) {
-	_spi->beginTransaction(_spiSettings);
-	digitalWrite(_pinCs, LOW);
-	digitalWrite(_pinDc, LOW);
-	_spi->transfer(command);
-	if (data && size) {
-		digitalWrite(_pinDc, HIGH);
-		_spi->transferBytes(data, nullptr, size);
+	// Mirrored output for HUD use
+	static uint16_t mirrorLine[SCREEN_WIDTH];
+
+	const int16_t mirroredX = SCREEN_WIDTH - 1 - x2;
+
+	for (uint16_t row = 0; row < height; row++) {
+		const uint16_t* src = color + (row * width);
+
+		for (uint16_t col = 0; col < width; col++) {
+			mirrorLine[col] = src[width - 1 - col];
+		}
+
+		_gfx->draw16bitRGBBitmap(mirroredX, y1 + row, mirrorLine, width, 1);
 	}
-	digitalWrite(_pinCs, HIGH);
-	_spi->endTransaction();
 }
 
-void SimpleSt7789::sendData(const uint8_t* data, size_t size) {
-	_spi->beginTransaction(_spiSettings);
-	digitalWrite(_pinCs, LOW);
-	digitalWrite(_pinDc, HIGH);
-	_spi->transferBytes(data, nullptr, size);
-	digitalWrite(_pinCs, HIGH);
-	_spi->endTransaction();
+void Esp32RgbDisplay::invertDisplay(bool invert) {
+	// An RGB panel has no ST7789-style hardware inversion command.
+	// Retained as a no-op so the existing theme controller still compiles.
+	(void)invert;
+}
+
+Arduino_GFX* Esp32RgbDisplay::gfx() {
+	return _gfx;
 }

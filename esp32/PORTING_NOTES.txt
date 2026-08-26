@@ -1,0 +1,16 @@
+Required Arduino setup
+======================
+ESP32 board package: 2.0.17
+Board: ESP32S3 Dev Module
+PSRAM: OPI PSRAM
+Flash size: normally 16 MB for ESP32-8048S050
+LVGL library: exactly 9.2.2
+Arduino_GFX: use the release that successfully ran the vendor HelloWorld demo
+
+Important
+=========
+The RGB panel has no ST7789 hardware color-inversion command. theme.h still
+calls lcd.invertDisplay(), but that method is intentionally a no-op. The UI
+will run, but light/dark flashing must later be reimplemented using LVGL styles.
+
+The LVGL draw buffer is 40 rows (64,000 bytes) and uses PARTIAL rendering.
