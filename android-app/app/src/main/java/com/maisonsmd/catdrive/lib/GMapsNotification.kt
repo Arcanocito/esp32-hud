@@ -14,6 +14,7 @@ import android.widget.ImageView
 import android.widget.RemoteViews
 import android.widget.TextView
 import androidx.core.view.children
+import android.util.Log
 import org.json.JSONObject
 import timber.log.Timber
 import android.graphics.Bitmap
@@ -46,6 +47,25 @@ internal class GMapsNotification(cx: Context, sbn: StatusBarNotification) : Navi
         }
 
         return Notification.Builder.recoverBuilder(mContext, mNotification).createContentView()
+    }
+
+    private fun collectTextViews(view: View): List<String> {
+        val result = mutableListOf<String>()
+
+        if (view is TextView) {
+            val text = view.text?.toString()?.trim()
+            if (!text.isNullOrBlank()) {
+                result.add(text)
+            }
+        }
+
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                result.addAll(collectTextViews(view.getChildAt(i)))
+            }
+        }
+
+        return result
     }
 
     private fun getRemoteViewGroup(remoteViews: RemoteViews?): ViewGroup {
@@ -98,145 +118,164 @@ internal class GMapsNotification(cx: Context, sbn: StatusBarNotification) : Navi
     private fun parseRemoteView(group: ViewGroup): NavigationData {
         val data = navigationData
 
-        val directionText = findChildByName(group, "text") as? TextView
-        val etaText = findChildByName(group, "header_text") as? TextView
-        val titleText = findChildByName(group, "title") as? TextView
-        val rightIcon = findChildByName(group, "right_icon") as? ImageView
-
         /*
-         * New Google Maps notification:
+         * Get all visible text from the Google Maps notification.
          *
-         * header_text:
-         * Maps · Ankunft um 15:19
+         * Current Google Maps layout examples:
          *
-         * Old Google Maps notification:
-         * 12 min · 5 km · 15:19 ETA
+         * "200 m · Links abbiegen auf Halberstädter Str."
+         * "Ankunft um 05:18"
+         *
+         * or:
+         *
+         * "Richtung Borchener Str. starten"
+         * "Ankunft um 05:13"
          */
-        parseEtaText(etaText?.text)?.let {
-            data.eta = it
+        val allTexts = collectTextViews(group)
+
+        Log.d("MapsParser", "Notification texts:")
+        allTexts.forEach {
+            Log.d("MapsParser", " -> $it")
         }
 
+        var distanceToNext: String? = null
+        var instruction: String? = null
+        var arrivalTime: String? = null
+
         /*
-         * New Google Maps notification:
+         * Matches for example:
          *
-         * title:
-         * 600 m · Rechts abbiegen auf Giselastraße
-         *
-         * Old Google Maps notification:
-         *
-         * title:
-         * 600 m
-         *
-         * text:
-         * Rechts abbiegen auf Giselastraße
+         * 200 m · Links abbiegen auf Halberstädter Str.
+         * 2,6 km · Rechts abbiegen auf Musterstraße
          */
-        var nextDistance = ""
-        var titleDirection = ""
+        val distanceAndInstructionRegex =
+            Regex(
+                """^\s*(\d+(?:[.,]\d+)?\s*(?:m|km))\s*[·•]\s*(.+)\s*$""",
+                RegexOption.IGNORE_CASE
+            )
 
-        titleText?.text
-            ?.toString()
-            ?.replace('\u00A0', ' ')
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { title ->
-                val titleParts = title.split('·', limit = 2)
+        /*
+         * Matches:
+         *
+         * Ankunft um 05:18
+         */
+        val arrivalRegex =
+            Regex(
+                """Ankunft\s+um\s+(\d{1,2}:\d{2})""",
+                RegexOption.IGNORE_CASE
+            )
 
-                if (titleParts.size == 2) {
-                    nextDistance = titleParts[0].trim()
-                    titleDirection = titleParts[1].trim()
-                } else {
-                    // Old layout: title contains only the maneuver distance.
-                    nextDistance = title
-                }
+        for (rawText in allTexts) {
+
+            /*
+             * Google Maps sometimes uses a non-breaking space.
+             * Convert it to a normal space before parsing.
+             */
+            val text = rawText
+                .replace('\u00A0', ' ')
+                .trim()
+
+            /*
+             * Example:
+             *
+             * 200 m · Links abbiegen auf Halberstädter Str.
+             */
+            val navMatch = distanceAndInstructionRegex.find(text)
+
+            if (navMatch != null) {
+                distanceToNext = navMatch.groupValues[1].trim()
+                instruction = navMatch.groupValues[2].trim()
+                continue
             }
 
-        var nextRoad = ""
-        var nextRoadDesc = ""
-
-        if (titleDirection.isNotEmpty()) {
             /*
-             * New layout: the complete direction is already contained in title.
+             * Example:
+             *
+             * Ankunft um 05:18
+             */
+            val arrivalMatch = arrivalRegex.find(text)
+
+            if (arrivalMatch != null) {
+                arrivalTime = arrivalMatch.groupValues[1]
+                continue
+            }
+
+            /*
+             * Some navigation states have no distance.
              *
              * Example:
-             * "Rechts abbiegen auf Giselastraße"
+             *
+             * Richtung Borchener Str. starten
              */
-            nextRoad = titleDirection
-        } else {
-            /*
-             * Old layout: parse the separate styled direction text.
-             */
-            val directionContent = directionText?.text
-
-            if (directionContent !is Spanned) {
-                // For example: "Rerouting..."
-                nextRoad = directionContent?.toString().orEmpty()
-
-                if (nextRoad.isNotEmpty()) {
-                    Timber.w(
-                        "Direction Text is not Spanned, text: %s",
-                        nextRoad
-                    )
-                }
-            } else {
-                /*
-                 * Road names are in Typeface.BOLD.
-                 * Additional direction text is in Typeface.NORMAL.
-                 */
-                val directionList = ParserHelper.splitByStyleSpan(
-                    directionContent,
-                    Typeface.NORMAL,
-                    2
-                )
-
-                if (directionList.isNotEmpty()) {
-                    val nextRoadList = mutableListOf(directionList.first())
-                    val nextRoadDescList =
-                        mutableListOf<ParserHelper.SpanSplitResult>()
-
-                    val rest = directionList.drop(1)
-
-                    val index = rest.indexOfFirst {
-                        it.isKeySpan && it.text.trim() != "/"
-                    }
-
-                    if (index == -1) {
-                        nextRoadList.addAll(rest)
-                    } else {
-                        nextRoadList.addAll(rest.subList(0, index))
-                        nextRoadDescList.addAll(
-                            rest.subList(index, rest.size)
+            if (
+                instruction == null &&
+                (
+                        text.startsWith("Richtung ", ignoreCase = true) ||
+                                text.contains("abbiegen", ignoreCase = true) ||
+                                text.contains("weiter", ignoreCase = true) ||
+                                text.contains("nehmen", ignoreCase = true) ||
+                                text.contains("fahren", ignoreCase = true) ||
+                                text.contains("wenden", ignoreCase = true) ||
+                                text.contains("halten", ignoreCase = true) ||
+                                text.contains("Ausfahrt", ignoreCase = true) ||
+                                text.contains("Kreisverkehr", ignoreCase = true)
                         )
-                    }
+            ) {
+                instruction = text
+            }
+        }
 
-                    nextRoad = nextRoadList
-                        .joinToString(" ") { it.text }
-                        .trim()
+        Log.d(
+            "MapsParser",
+            "distanceToNext = $distanceToNext"
+        )
 
-                    nextRoadDesc = nextRoadDescList
-                        .joinToString(" ") { it.text }
-                        .trim()
-                }
+        Log.d(
+            "MapsParser",
+            "instruction = $instruction"
+        )
+
+        Log.d(
+            "MapsParser",
+            "arrivalTime = $arrivalTime"
+        )
+
+        /*
+         * Update navigation information.
+         *
+         * Google Maps currently only gives us the arrival time.
+         * ETE / remaining total distance are no longer present
+         * in this notification layout.
+         */
+        arrivalTime?.let { time ->
+            parseEtaText("Ankunft um $time")?.let { parsedEta ->
+                data.eta = parsedEta
             }
         }
 
         data.nextDirection = NavigationDirection(
-            nextRoad,
-            nextRoadDesc,
-            nextDistance
+            instruction.orEmpty(),       // navigation instruction
+            "",                          // no separate description anymore
+            distanceToNext.orEmpty()     // distance to next maneuver
         )
 
         /*
-         * Copy the maneuver icon.
+         * Maneuver icon.
+         *
+         * This still appears to use right_icon, so we can leave
+         * the existing icon parser unchanged.
          */
+        val rightIcon =
+            findChildByName(group, "right_icon") as? ImageView
+
         (rightIcon?.drawable as? BitmapDrawable)?.bitmap?.let { bitmap ->
-            val bitmapConfig = bitmap.config ?: Bitmap.Config.ARGB_8888
+            val bitmapConfig =
+                bitmap.config ?: Bitmap.Config.ARGB_8888
 
             data.actionIcon = NavigationIcon(
                 bitmap.copy(bitmapConfig, false)
             )
         }
-
-        // Timber.v("$data")
 
         return data
     }
